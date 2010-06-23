@@ -8,41 +8,48 @@
 #  DESCRIPTION:  This program push a request to puppet clients for a synchronisation
 #
 #      OPTIONS:  ---
-# REQUIREMENTS:  You need to have a ssh key exchange done with all your wished nodes
+# REQUIREMENTS:  You need to have a ssh key exchange with all your wished nodes
+#                You also need a symlink of puppetd : ln -s /opt/csw/bin/puppetd /usr/bin/
 #         BUGS:  ---
 #        NOTES:  ---
 #       AUTHOR:  Pierre Mavro (), pierre@mavro.fr
 #      COMPANY:  
-#      VERSION:  0.1a
+#      VERSION:  0.1b
 #      CREATED:  04/06/2010 16:23:07
 #     REVISION:  ---
 #===============================================================================
 
-#use strict;
-#use warnings;
+use strict;
+use warnings;
+no warnings 'closure';
 use Getopt::Long;
 use threads;
 use threads::shared;
 use Term::ANSIColor;
+use Sys::Hostname;
 
 # Help print
 sub help
 {
     print <<"print_help";
-Usage : puppet_push [-h] [-l|-s] [-pca puppetca_path] [-n nodes] [-y]
+Usage : puppet_push [-h] [-l|-s] [-pca puppetca_path] [-n nodes] [-e nodes] [-t tag] [-y] [-mt threads] [-v] [-d]
 
 Options :
 -h, --help\n\tPrint this help screen
 -l, --list\n\tList registered nodes
--s, --sync\n\tSend a request for sync
--pca\n\tSet puppetca binary full path
--n\n\tNodes to be synchronized
+-s, --sync\n\tSend a request on Puppet clients for sync
+-pca\n\tSet puppetca binary full path (default is /usr/sbin/puppetca)
+-n\n\tNodes to be synchronized from master
 -e\n\tNodes to exclude from synchronisation
+-t\n\tSet tags (Puppet class) to sync (default all)
 -y, --yesall\n\tAlways answer yes to any questions
--mt, --simultanous\n\tNumber of maximum simultanous clients requests (Default is 2)
+-mt, --simultanous\n\tNumber of maximum simultanous clients sync requests (Default is 2)
+-v, --verbose\n\tVerbose output
+-d, --debug\n\tDebug mode
 
 Examples :
-puppet_push -s
+puppet_push -l
+puppet_push -s -n puppet_fr_client-\\d+ -n puppet_us_client-\\d+ -e puppet_client-2.mydomain.com -t ntp -t ldapclient -mt 4
 print_help
     exit 1;
 }
@@ -53,7 +60,7 @@ sub check_opts
     help unless(defined(@ARGV));
     
     # Vars
-    my ($puppetca_bin, $list, $nodes_file, $sync, @nodes, @exclude, $yes, $max_threads);
+    my ($puppetca_bin, $list, $nodes_file, $sync, @nodes, @exclude, @tags, $yes, $max_threads, $verbose, $debug);
 
     # Set options
     GetOptions( "help|h"            => \&help,
@@ -62,8 +69,11 @@ sub check_opts
                 "s|sync"            => \$sync,
                 "n=s"               => \@nodes,
                 "e=s"               => \@exclude,
+                "t=s"               => \@tags,
                 "y|yesall"          => \$yes,
-                "mt|simultanous=s"  => \$max_threads);
+                "mt|simultanous=s"  => \$max_threads,
+                "v|verbose"         => \$verbose,
+                "d|debug"           => \$debug);
 
     # Check if defined 
     unless (defined($puppetca_bin))
@@ -85,15 +95,15 @@ sub check_opts
     # List mode asked
     if ($list)
     {
-        print "\nPlease wait while collecting...";
-        &list_registred_nodes($puppetca_bin);
+        print "\nPlease wait while collecting data...";
+        list_registred_nodes($puppetca_bin);
         exit 0;
     }
 
     # Synchronize nodes
     if ($sync)
     {
-        &sync($puppetca_bin,\@nodes,\@exclude,$yes,$max_threads);
+        sync($puppetca_bin,\@nodes,\@exclude,\@tags,$yes,$max_threads,$verbose,$debug);
     }
 }
 
@@ -101,6 +111,7 @@ sub check_opts
 sub get_registred_nodes
 {
     my $puppetca_bin = shift;
+    my $host = hostname;
     my @all_nodes;
     
     # Execute puppetca bin to get all the list of node and check those which can be deployed
@@ -110,7 +121,11 @@ sub get_registred_nodes
         chomp $_;
         if (/^\+\s*(.+)/)
         {
-            push @all_nodes, $1;
+            my $current_node = $1;
+            if ($current_node !~ /^$host/)
+            {
+                push @all_nodes, $1;    
+            }
         }
     }
     close (PUPPETCA);
@@ -173,20 +188,17 @@ sub sync
     my @nodes = @$ref_nodes;
     my $ref_exclude = shift;
     my @exclude = @$ref_exclude;
+    my $ref_tags = shift;
+    my @tags = @$ref_tags,
     my $yes=shift;
     my $max_threads=shift;
+    my $tags_list;
+    my $verbose = shift;
+    my $debug = shift;
 
     # Get registred_nodes
     my $ref_registred_nodes = get_registred_nodes($puppetca_bin);
     my @registred_nodes = @$ref_registred_nodes;
-    #my @registred_nodes;
-    #open (FILER, "<liste");
-    #while (<FILER>)
-    #{
-    #chomp $_;
-    #    push @registred_nodes, $_;
-    #}
-    #close (FILER);
 
     # Syncronization function   
     sub launch_sync
@@ -194,19 +206,38 @@ sub sync
         my $total_nodes_to_sync=shift;
         my $ref_nodes_to_sync=shift;
         my @nodes_to_sync : shared = @$ref_nodes_to_sync;
+        my $full_tags = shift;
+        $full_tags = 1 unless (defined($full_tags));
         my $max_threads=shift;
         my @threads;
+        my $analyze=shift;
 
         # Multitreading tasks
         sub launch_thread
         {
+            my $full_tags=shift;
+            $full_tags = '' if ($full_tags eq '1');
+            my $analyze = shift;
+            
             # Launch code to ask puppet clients to synchronize
             sub execute
             {
                 my $node = shift;
+                my $full_tags = shift;
+                my $analyze = shift;
 
-                # Launch puppet client sync
-                system("ssh root\@$node puppetd --no-daemon --onetime &> /dev/null");
+                # Launch puppet client sync with or not debug/verbose mode
+                if ($analyze eq '1')
+                {
+                    system("ssh root\@$node puppetd --no-daemon --onetime $full_tags $analyze");
+                }
+                else
+                {
+                    system("ssh root\@$node puppetd --no-daemon --onetime $full_tags 2>&1 > /dev/null");    
+                }
+                
+                # Devide return code to get real exit code;
+                return $? / 256;
             }
 
             # Verify the synchronization between the client and the server
@@ -217,7 +248,7 @@ sub sync
                 my $dir = "/var/lib/puppet/reports/$node";
 
                 # Get latest file
-                opendir (REPORTS, $dir) or die "Jen e peux pas ouvrir le dossier de logs : $!\n";
+                opendir (REPORTS, $dir) or die "Sorry but I can't open logs file ($dir) : $!\n";
                 my @sorted = sort {-M "$dir/$a" <=> -M "$dir/$b"} readdir(REPORTS);
                 closedir REPORTS;
 
@@ -254,9 +285,17 @@ sub sync
                 }
                 else
                 {
-                    execute($node);
+                    my $result=-1;
+                    my $return_execute_code = execute($node,$full_tags,$analyze);
                     # Check result
-                    my $result = check_result($node);
+                    if ($return_execute_code == 1)
+                    {
+                        $result = 1;
+                    }
+                    else
+                    {
+                        $result = check_result($node);
+                    }
                     if ($result == 0)
                     {
                         print_color("$node","[ OK ]");
@@ -276,7 +315,7 @@ sub sync
         # Launching threads
         for (1 .. $max_threads)
         {
-            my $thread = threads->create('launch_thread');
+            my $thread = threads->create('launch_thread', "$full_tags", "$analyze");
             push @threads, $thread;
         }
         
@@ -290,22 +329,71 @@ sub sync
         print "\nDone !\n";
     }
 
+    # Detect if tags are asked or multiple. Then sort them in puppet format
+    sub check_multi_tags
+    {
+        my $ref_tags = shift;
+        my @tags = @$ref_tags;
+        my $total_tags = shift;
+        
+        if ($total_tags == 1)
+        {
+            return "--tags $tags[0]";
+        }
+        elsif ($total_tags > 1)
+        {
+            my $multi_tags = join ',', @tags;
+            return "--tags $multi_tags";
+        }
+        else
+        {
+            return;
+        }
+    }
+
+    # Check tags
+    my $total_tags = @tags;
+    if ($total_tags > 0)
+    {
+        $tags_list = "with only @tags tags";
+    }
+    else
+    {
+        $tags_list = '';
+    }
+    my $full_tags = check_multi_tags(\@tags,$total_tags);
+
+    # Verbose and Debug checking
+    my $analyze='';
+      
+    # Check if verbose is asked 
+    if ($verbose)
+    {
+        $analyze .= ' --verbose';
+    }
+    # Check if debug is asked
+    if ($debug)
+    {
+        $analyze .= ' --debug';
+    }
+
     # Check if requesting a 'all nodes sync'
     unless (@nodes)
     {
         my @needed_array;
-        
+
+        # If auto yes is asked
         unless ($yes)
         {
             # Check if yesall is requested
-            print "\nAre you requesting a synchronization for all nodes (y/n) ? ";
+            print "\nAre you requesting a synchronization for all nodes $tags_list (y/n) ? ";
             my $answer = <STDIN>;
             chomp $answer;
 
             # Launching synchronization will all nodes
             if ($answer =~ /^y$/i)
             {
-                launch_sync('all',\@registred_nodes,$max_threads);
+                launch_sync('all',\@registred_nodes,$full_tags,$max_threads,$analyze);
             }
             # Exiting because user requested
             elsif ($answer =~ /^n$/i)
@@ -322,7 +410,7 @@ sub sync
         }
         else
         {
-            launch_sync('all',\@registred_nodes,$max_threads);
+            launch_sync('all',\@registred_nodes,$full_tags,$max_threads,$analyze);
         }
     }
     # Else only sync requested nodes
@@ -390,6 +478,7 @@ sub sync
         # Sync nodes
         if ($total_nodes_to_sync > 0)
         {
+            # If auto yes is asked
             unless ($yes)
             {
                 # Showing list of node to be sync
@@ -399,12 +488,12 @@ sub sync
                     print "$_\n";   
                 }
 
-                print "\nAre you sure do you want to continue (y/n) ? ";
+                print "\nAre you sure do you want to continue $tags_list (y/n) ? ";
                 my $answer = <STDIN>;
                 chomp $answer;
                 if ($answer =~ /^y$/i)
                 {
-                    launch_sync($total_nodes_to_sync,\@nodes_to_sync,$max_threads);
+                    launch_sync($total_nodes_to_sync,\@nodes_to_sync,$full_tags,$max_threads,$analyze);
                 }
                 # Exiting because user requested
                 elsif ($answer =~ /^n$/i)
@@ -419,10 +508,11 @@ sub sync
                     exit 1;
                 }
             }
+            # Else confirm
             else
             {
                 print "\nSynchronizing puppets clients with master :\n";
-                launch_sync($total_nodes_to_sync,\@nodes_to_sync,$max_threads);
+                launch_sync($total_nodes_to_sync,\@nodes_to_sync,$full_tags,$max_threads,$analyze);
             }
         }
         else
