@@ -3,7 +3,7 @@ puppet_push
 
 Ask Puppet to synchronize from a master node
 
-
+```
 Usage : puppet_push [-h] [-l|-s] [-pca puppetca_path] [-n nodes] [-e nodes] [-t tag] [-y] [-mt threads] [-v] [-d]
 
 Options :
@@ -33,3 +33,14 @@ Options :
 Examples :
 puppet_push -l
 puppet_push -s -n puppet_fr_client-\d+ -n puppet_us_client-\d+ -e puppet_client-2.mydomain.com -t ntp -t ldapclient -mt 4
+```
+
+License
+-------
+
+GPL
+
+Author Information
+------------------
+
+Pierre Mavro / deimosfr
